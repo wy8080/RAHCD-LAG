@@ -354,4 +354,3 @@ def balance_loss(q, eps=1e-8):
     marginal = q.mean(dim=0).clamp(min=eps)
     uniform = torch.full_like(marginal, 1.0 / marginal.numel())
     return F.kl_div(marginal.log(), uniform, reduction="sum")
-#（注：内容由AI生成）
