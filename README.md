@@ -1,107 +1,106 @@
-# 双曲原型图聚类（拆分版）
+# Reliability-Aware Hyperbolic Community Detection for Large-Scale Attributed Graphs
 
-将原 `main.py` 按职责拆成若干模块，**训练逻辑与数值行为逐行保持不变**：数据读取与特征平滑、随机游走采样子图、双曲流形与损失、评估各自独立，`main.py` 只保留顶部参数配置与训练流程。
+## 1. Layout
 
-## 1. 目录结构
+| File | Responsibility |
+| --- | --- |
+| `main.py` | Configuration block + `train_adaptive_pipeline` (warmup / main training / prototype init / checkpointing) |
+| `data_preprocess.py` | Dataset loading (OGB, MAG-Scholar-C, Amazon, Planetoid), label and edge-index normalisation, degree statistics, feature smoothing |
+| `graph_sampling.py` | `GraphStorage` (CSR whole-graph storage + induced-subgraph extraction), `weighted_random_walk_partition` (MMRW sampling), `build_batches` |
+| `hyperbolic.py` | `SafePoincareSpace` (exp/log maps and distances on the Poincare ball), membership gate, `HyperbolicPrototypeEncoder`, the three losses plus the balance regulariser |
+| `evaluation.py` | Global modularity statistics, `modularity_score`, ARI / NMI / ACC, hard assignments, `evaluate_model`, with a CLI entry point |
+| `utils.py` | `set_seed`, `save_checkpoint`, `load_checkpoint` |
+| `resource_monitor.py` | Training resource monitor (CPU / memory / GPU utilisation, VRAM, power, temperature); optional |
+| `requirements.txt` | Dependencies |
 
-| 文件 | 职责 |
-|---|---|
-| `main.py` | 顶部参数配置 + `train_adaptive_pipeline` 训练流程（warmup / 主训练 / 原型初始化 / 保存） |
-| `data_preprocess.py` | 数据集读取（OGB / MAG-Scholar-C / Amazon / Planetoid）、标签与边索引规范化、度数统计、特征平滑 |
-| `graph_sampling.py` | `GraphStorage`（CSR 全图存储 + 诱导子图抽取）、`weighted_random_walk_partition`（MMRW 采样）、`build_batches` |
-| `hyperbolic.py` | `SafePoincareSpace`（庞加莱球 exp/log 映射与距离）、成员度门控、`HyperbolicPrototypeEncoder`、三个损失 + 平衡正则 |
-| `evaluation.py` | 模块度全局统计、`modularity_score`、ARI/NMI/ACC、预测硬分配、`evaluate_model`，带命令行入口 |
-| `utils.py` | `set_seed`、`save_checkpoint`、`load_checkpoint` |
-| `resource_monitor.py` | 训练资源监控（CPU / 内存 / GPU 利用率、显存、功耗、温度），可选 |
-| `requirements.txt` | 环境依赖 |
-
-## 2. 环境安装
+## 2. Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-依赖关键版本：`torch==2.2.2+cu118`、`torch_geometric==2.4.0`、`torch_sparse==0.6.18+pt22cu118`、`ogb==1.3.6`、`scikit-learn==1.7.2`、`numba==0.67.0`。
+Pinned versions that matter: `torch==2.2.2+cu118`, `torch_geometric==2.4.0`, `torch_sparse==0.6.18+pt22cu118`, `ogb==1.3.6`, `scikit-learn==1.7.2`, `numba==0.67.0`.
 
-`torch_sparse` 与 `torch_scatter` 需与 torch / CUDA 版本匹配，若 pip 直接安装失败，按 PyG 官方 wheel 源安装：
+`torch_sparse` and `torch_scatter` must match the torch / CUDA build. If plain pip fails, use the PyG wheel index:
 
 ```bash
 pip install torch_sparse -f https://data.pyg.org/whl/torch-2.2.2+cu118.html
 ```
 
-`numba` 可选：缺失时随机游走的累积分布会退化为纯 Python 循环（结果相同，仅变慢）。
+`numba` is optional. Without it, the cumulative-weight table used by the random walks falls back to a pure-Python loop — identical results, only slower.
 
-## 3. 数据准备
+## 3. Data
 
-| 数据集 | 路径 | 说明 |
-|---|---|---|
-| `ogbn-arxiv` / `ogbn-products` | `{save_path}/data/ogb` | 首次运行自动下载 |
-| `cora` / `citeseer` | `{save_path}/data/{name}` | 自动下载 |
-| `photo` / `computers` | `{save_path}/data/{name}` | 自动下载 |
-| `mag_scholar_c` | `{save_path}/data/mag_scholar_c` | 需手工放置 `features.npz`（稀疏特征）、`edge_index.pt`、`labels.pt` |
+| Dataset | Location | Notes |
+| --- | --- | --- |
+| `ogbn-arxiv` / `ogbn-products` | `{save_path}/data/ogb` | Downloaded automatically on first run |
+| `cora` / `citeseer` | `{save_path}/data/{name}` | Downloaded automatically |
+| `photo` / `computers` | `{save_path}/data/{name}` | Downloaded automatically |
+| `mag_scholar_c` | `{save_path}/data/mag_scholar_c` | Requires `features.npz` (sparse features), `edge_index.pt`, `labels.pt` placed manually |
 
-`save_path` 在 `main.py` 顶部配置，默认 `/root/autodl-tmp`。MAG-Scholar-C 会先做 128 维 TruncatedSVD 再 L1 归一化。
+`save_path` is configured at the top of `main.py` (default `/root/autodl-tmp`). MAG-Scholar-C features are reduced to 128 dimensions with TruncatedSVD and then L1-normalised.
 
-## 4. 运行
+## 4. Running
 
 ```bash
 python main.py
 ```
 
-改数据集只需修改 `main.py` 顶部两行：
+To switch datasets, edit the two lines at the top of `main.py`:
 
 ```python
 dataset_name = "ogbn-products".lower()
-is_large_graph = True          # 大图走 MMRW 采样；cora / citeseer / photo / computers 设为 False
+is_large_graph = True          # True: MMRW-sampled subgraphs; set False for cora / citeseer / photo / computers
 ```
 
-训练产物：
-- `{SAVE_DIR}/{dataset_name}.pt` —— 用于「已有检查点则跳过训练」的缓存
-- `{SAVE_DIR}/{dataset_name}/final.pt` —— 训练结束保存的最终模型
+Outputs:
 
-`SAVE_DIR` 默认 `./checkpoints`。
+- `{SAVE_DIR}/{dataset_name}.pt` — cache used to skip training when a checkpoint already exists
+- `{SAVE_DIR}/{dataset_name}/final.pt` — final model written at the end of training
 
-## 5. 配置说明（`main.py` 顶部）
+`SAVE_DIR` defaults to `./checkpoints`.
 
-### 5.1 运行级参数
+## 5. Configuration (top of `main.py`)
 
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `save_path` | `/root/autodl-tmp` | 数据集根目录 |
-| `SAVE_DIR` | `./checkpoints` | 检查点输出目录 |
-| `seed` | `1` | 全局随机种子（Python / NumPy / Torch），同时用于随机游走 RNG 与 KMeans |
-| `dataset_name` | `ogbn-products` | 数据集名，决定下方超参分支 |
-| `is_large_graph` | `True` | `True`：MMRW 采样子图训练；`False`：全图训练 |
-| `use_ema_prototype` | `= is_large_graph` | `True`：原型做 EMA 更新（缓冲变量）；`False`：原型为可学习参数 |
-| `lambda_bal` | `0.05` | 簇平衡 KL 损失权重 |
-| `lambda_rec` | `0.05` | 图重构损失权重 |
-| `k_steps` | `2` | 特征平滑迭代步数（`0` 表示不平滑） |
-| `alpha` | `0.5` | 平滑残差系数：`h ← alpha*h + (1-alpha)*A_norm*h` |
-| `ema_momentum` | 分支内赋值 | 原型 EMA 动量（`ogbn-products` 为 0.995） |
+### 5.1 Runtime parameters
 
-### 5.2 数据集分支超参
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `save_path` | `/root/autodl-tmp` | Dataset root directory |
+| `SAVE_DIR` | `./checkpoints` | Checkpoint output directory |
+| `seed` | `1` | Global seed (Python / NumPy / Torch); also seeds the walk RNG and KMeans |
+| `dataset_name` | `ogbn-products` | Selects the hyper-parameter branch below |
+| `is_large_graph` | `True` | `True`: train on sampled subgraphs; `False`: train on the full graph |
+| `use_ema_prototype` | `= is_large_graph` | `True`: prototypes updated by EMA (buffers); `False`: prototypes are learnable parameters |
+| `lambda_bal` | `0.05` | Weight of the cluster-balance KL term |
+| `lambda_rec` | `0.05` | Weight of the graph reconstruction loss |
+| `k_steps` | `2` | Number of feature-smoothing steps (`0` disables smoothing) |
+| `alpha` | `0.5` | Residual coefficient: `h <- alpha * h + (1 - alpha) * A_norm @ h` |
+| `ema_momentum` | set inside the branch | Prototype EMA momentum (`0.995` for `ogbn-products`) |
 
-| 变量 | 作用 |
-|---|---|
-| `epochs` | 总训练轮数 |
-| `warmup_epochs` | 仅用重构损失的预热轮数；结束时用 KMeans 初始化原型 |
-| `lr_warmup` / `wd_warmup` | 预热阶段 Adam 学习率 / 权重衰减 |
-| `lr_main` / `wd_main` | 主阶段 AdamW 学习率 / 权重衰减 |
-| `eta_min_ratio` | 余弦退火下限 = `lr_main * eta_min_ratio` |
-| `hidden_dim` | 编码器输出维度（即切空间维度） |
-| `middle_dim` | 编码器隐层宽度 |
-| `drop_out` | 编码器 Dropout 概率 |
-| `WALK_ROOTS_PER_BATCH` | 每个 batch 的随机游走根节点数 |
-| `WALK_NUM_BATCHES` | batch 数量 |
-| `WALK_T_PER_ROOT` | 每个根节点出发的游走次数 |
-| `WALK_DEPTH` | 单次游走长度 |
-| `WALK_TAU_FEAT` | 特征相似度权重温度：`exp(cos/tau)` |
-| `WALK_MAX_BATCH` / `WALK_MIN_BATCH` | 单 batch 节点数上限 / 下限（低于下限的 batch 丢弃） |
+### 5.2 Per-dataset hyper-parameters
 
-现有分支取值：
+| Variable | Meaning |
+| --- | --- |
+| `epochs` | Total number of epochs |
+| `warmup_epochs` | Epochs trained with the reconstruction loss only; prototypes are KMeans-initialised when warmup ends |
+| `lr_warmup` / `wd_warmup` | Adam learning rate / weight decay during warmup |
+| `lr_main` / `wd_main` | AdamW learning rate / weight decay in the main phase |
+| `eta_min_ratio` | Cosine-annealing floor = `lr_main * eta_min_ratio` |
+| `hidden_dim` | Encoder output dimension (i.e. the tangent-space dimension) |
+| `middle_dim` | Encoder hidden width |
+| `drop_out` | Encoder dropout probability |
+| `WALK_ROOTS_PER_BATCH` | Number of random-walk roots per batch |
+| `WALK_NUM_BATCHES` | Number of batches |
+| `WALK_T_PER_ROOT` | Walks started from each root |
+| `WALK_DEPTH` | Length of a single walk |
+| `WALK_TAU_FEAT` | Feature-similarity temperature: `exp(cos / tau)` |
+| `WALK_MAX_BATCH` / `WALK_MIN_BATCH` | Upper / lower bound on batch size (batches below the lower bound are dropped) |
 
-| 数据集 | epochs | warmup | lr_warmup | lr_main | hidden | drop_out |
-|---|---|---|---|---|---|---|
+Current values:
+
+| Dataset | epochs | warmup | lr_warmup | lr_main | hidden | drop_out |
+| --- | --- | --- | --- | --- | --- | --- |
 | `ogbn-arxiv` | 180 | 30 | 1e-3 | 5e-4 | 128 | 0.1 |
 | `ogbn-products` | 180 | 80 | 1e-2 | 5e-4 | 128 | 0.1 |
 | `citeseer` | 400 | 150 | 1e-4 | 5e-5 | 256 | 0.5 |
@@ -110,60 +109,48 @@ is_large_graph = True          # 大图走 MMRW 采样；cora / citeseer / photo
 | `computers` | 500 | 150 | 5e-3 | 4e-5 | 256 | 0.1 |
 | `mag_scholar_c` | 200 | 50 | 1e-2 | 5e-4 | 128 | 0.1 |
 
-新增数据集：在分支链里补一段赋值即可，或在 `data_preprocess.load_data` 中补对应的读取分支。
+To add a dataset, append one more branch to the chain, or add a loader branch in `data_preprocess.load_data`.
 
-> 注意：`WALK_*` 只在 `ogbn-arxiv` / `ogbn-products` / `mag_scholar_c` 三个分支里定义。若在小图数据集上把 `is_large_graph` 设为 `True`，这些变量不存在会报 `NameError`；反之在大图数据集上设为 `False` 不受影响（这是原代码的既有行为，未改动）。
+> Note: `WALK_*` is only defined in the `ogbn-arxiv`, `ogbn-products` and `mag_scholar_c` branches. Setting `is_large_graph = True` on a small-graph dataset raises `NameError` because those names do not exist; setting it to `False` on a large dataset is harmless. This is pre-existing behaviour and was deliberately left untouched.
 
-### 5.3 检查点行为
+### 5.3 Checkpoint behaviour
 
 ```python
 model, data, y_true = train_adaptive_pipeline(
     dataset_name=dataset_name, hidden_dim=hidden_dim,
     epochs=epochs, warmup_epochs=warmup_epochs,
     is_large_graph=is_large_graph,
-    load_pretrained=False,   # True 且缓存存在时，直接加载并 return，不训练
-    force_retrain=True,      # True 强制重新训练
+    load_pretrained=False,   # True + existing cache: load and return without training
+    force_retrain=True,      # True: always retrain from scratch
 )
 ```
 
-即 `load_pretrained=True and force_retrain=False` 且 `{SAVE_DIR}/{dataset_name}.pt` 存在时，跳过训练直接返回模型。
+When `load_pretrained=True` and `force_retrain=False` and `{SAVE_DIR}/{dataset_name}.pt` exists, training is skipped and the cached model is returned.
 
-## 6. 评估
+## 6. Evaluation
 
-`evaluation.py` 可单独作为脚本运行（从检查点自动推断 `in_features / middle_dim / hidden_dim / 簇数 / 是否 EMA 原型`，无需手工填超参）：
+`evaluation.py` also works as a standalone script. It infers `in_features / middle_dim / hidden_dim / cluster count / whether prototypes are EMA-based` from the checkpoint, so no hyper-parameters have to be filled in by hand:
 
 ```bash
-# 全图数据集
+# Full-graph dataset
 python evaluation.py --dataset-name cora \
     --checkpoint ./checkpoints/cora/final.pt \
     --data-root /root/autodl-tmp
 
-# 大图（按采样方式推理，再用全图边计算模块度）
+# Large graph (inference follows the sampled batches, modularity uses the full graph)
 python evaluation.py --dataset-name ogbn-products --is-large-graph \
     --checkpoint ./checkpoints/ogbn-products/final.pt
 ```
 
-输出示例：
+- `ARI` / `NMI`: agreement with the ground-truth labels; `ACC`: accuracy after Hungarian matching.
+- `Modularity`: Newman modularity computed from the cached global degree statistics and `2m`, consistent with `global_deg / global_m2` used inside the training losses.
+- In large-graph mode nodes are encoded batch by batch; nodes that never fall into a batch stay at `-1` and are excluded from the metrics.
+- Sampling arguments default to the `ogbn-products` values and can be overridden with `--roots-per-batch / --num-batches / --t-per-root / --walk-depth / --tau-feat / --max-batch / --min-batch`.
+- Other flags: `--k-steps`, `--alpha` (must match training), `--drop-out`, `--ema-momentum`, `--device`, `--data-root`, `--save-dir`.
 
-```json
-{
-  "n_evaluated": 232965,
-  "ARI": 0.4123,
-  "NMI": 0.5012,
-  "ACC": 0.6431,
-  "Modularity": 0.5871
-}
-```
+Evaluation is a standalone utility. **The training pipeline does not call it**, so the original training logic is untouched.
 
-- `ARI` / `NMI`：与真实标签的聚类一致性；`ACC`：匈牙利匹配后的最优映射准确率。
-- `Modularity`：以全图缓存的度数统计与 `2m` 计算的 Newman 模块度，与训练时损失中的 `global_deg / global_m2` 定义一致。
-- 大图模式下节点按 batch 推理，未落入任何 batch 的节点记为 `-1`，不计入指标。
-- 大图的采样参数默认对齐 `ogbn-products`，可用 `--roots-per-batch / --num-batches / --t-per-root / --walk-depth / --tau-feat / --max-batch / --min-batch` 覆盖。
-- 其他参数：`--k-steps`、`--alpha`（必须与训练时一致）、`--drop-out`、`--ema-momentum`、`--device`、`--data-root`、`--save-dir`。
-
-评估为独立工具，**训练流程本身不调用它**，因此不影响原有训练逻辑。
-
-## 7. 训练资源监控（可选）
+## 7. Resource monitor (optional)
 
 ```python
 from resource_monitor import ResourceMonitor
@@ -171,47 +158,48 @@ from resource_monitor import ResourceMonitor
 monitor = ResourceMonitor(interval=1.0)
 monitor.start()
 
-# 训练 ...
+# ... training ...
 
 monitor.stop()
-monitor.report()          # 打印汇总
-summary = monitor.summary()   # 结构化 dict，便于落盘
+monitor.report()               # human-readable summary
+summary = monitor.summary()    # structured dict, easy to dump to disk
 ```
 
-监控 CPU 利用率、系统内存、每张 GPU 的利用率 / 显存 / 功耗 / 温度，以及 PyTorch 的峰值显存。
+It tracks CPU utilisation, system memory, per-GPU utilisation / VRAM / power / temperature, and PyTorch peak memory.
 
-## 8. 模块接口速查
+## 8. Module API cheat sheet
 
 ```python
-# 数据
+# Data
 from data_preprocess import prepare_data
 data, num_classes, y_true, num_nodes, global_deg, global_m2 = prepare_data(
     dataset_name, save_path, k_steps, alpha)
-# 平滑特征在 data.x_input
+# smoothed features are stored in data.x_input
 
-# 采样
+# Sampling
 from graph_sampling import GraphStorage, weighted_random_walk_partition, build_batches
 graph_storage = GraphStorage(data.edge_index, num_nodes, data.x_input, device)
 batches = weighted_random_walk_partition(graph_storage, roots_per_batch=..., seed=seed)
 batch_data = build_batches(graph_storage, batches, data.x_input)   # [{node_ids, x, edge_index, num_nodes}]
 
-# 模型与损失
+# Model and losses
 from hyperbolic import HyperbolicPrototypeEncoder, compute_graph_rec_loss, \
      hyperbolic_modularity_loss, scalable_hsc_loss, balance_loss
 model = HyperbolicPrototypeEncoder(in_features, hidden_dim, num_clusters,
         middle_dim=middle_dim, drop_out=drop_out,
         use_ema_prototype=..., ema_momentum=..., is_large_graph=..., seed=seed)
 
-# 评估
+# Evaluation
 from evaluation import evaluate_model
 report = evaluate_model(model, y_true, num_classes=num_classes,
         x_input=data.x_input, edge_index=data.edge_index,
         num_nodes=num_nodes, device=device)
 ```
 
-## 9. 关于本次拆分
+## 9. Notes on this split
 
-- 所有被搬移的函数 / 类，函数体与原文逐行一致（仅新增英文 docstring）。
-- 原代码依赖 `main.py` 模块级全局变量 `middle_dim`、`drop_out`、`is_large_graph`、`seed` 的地方，改为显式传参（`HyperbolicPrototypeEncoder` 构造参数），数值来源仍是顶部配置，计算结果不变。
-- 平滑特征后删除 `data.x`、`prepare_data` 中被丢弃的中间张量、`gc.collect()` 调用位置，均与原文一致，峰值内存行为不变。
-- 全部中文注释已移除并改写为英文注释 / docstring；运行时打印的字符串保持原样（含中文），以保证输出与原来一致。若需要一并英文化，直接改 `print` 文案即可，不影响逻辑。
+- Every moved function and class keeps its body identical to the original; only English docstrings were added.
+- Places where the encoder previously read the module-level globals `middle_dim`, `drop_out`, `is_large_graph` and `seed` now take them as constructor arguments. The values still come from the configuration block at the top of `main.py`, and the computation is unchanged.
+- Memory behaviour is preserved: `data.x` is deleted after smoothing, the intermediate tensors discarded in the original are still discarded, and every `gc.collect()` call sits where it did before.
+- All Chinese comments were removed and rewritten as English comments / docstrings. Console messages printed at runtime were kept in their original wording so that output stays identical to the original run; translating them does not affect the logic.
+- New in this split: `evaluation.py` turns the previously imported-but-unused `adjusted_rand_score`, `normalized_mutual_info_score` and `linear_sum_assignment` into actual metrics, and adds a modularity score. `set_graph_for_modularity` — which the training loop still calls — lives there as well. Training does not invoke any of the new metrics.
