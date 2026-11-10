@@ -204,4 +204,3 @@ def build_batches(graph_storage, batches, x_input, desc="Preparing batches"):
             }
         )
     return batch_data
-#（注：内容由AI生成）
