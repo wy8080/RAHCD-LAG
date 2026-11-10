@@ -154,4 +154,3 @@ def prepare_data(dataset_name, save_path, k_steps, alpha):
     global_m2 = global_deg.sum().clamp(min=1.0)
 
     return data, num_classes, y_true, num_nodes, global_deg, global_m2
-#（注：内容由AI生成）
