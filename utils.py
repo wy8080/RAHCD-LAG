@@ -27,4 +27,3 @@ def load_checkpoint(path, model, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     return ckpt
-#（注：内容由AI生成）
